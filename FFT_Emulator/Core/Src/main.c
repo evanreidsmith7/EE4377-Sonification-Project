@@ -21,9 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <string.h>
-#include <stdio.h>
-
+#define ARM_MATH_CM4
+#include "arm_math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,8 +32,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+
+
 //number of samples that we will contain in the buffer
 #define ADC_BUF_LEN 4096
+#define FFT_SIZE 4096
+
 
 /* USER CODE END PD */
 
@@ -48,11 +52,11 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
 
-//4096 12bit sample values
-uint16_t adc_buf[ADC_BUF_LEN];
+
 
 /* USER CODE END PV */
 
@@ -63,11 +67,35 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
-
+void DoFFT(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+//4096 12bit sample values
+uint16_t adc_buf[ADC_BUF_LEN];
+
+float fft_in_buf[FFT_SIZE];
+float fft_out_buf[FFT_SIZE];
+
+
+arm_rfft_fast_instance_f32 fft_handler;
+
+float real_fsample = 1400000;
+uint8_t outarray[FFT_SIZE / 2];
+uint8_t uartfree = 1;
+uint8_t dmafree = 0;
+
+
+// Define different states
+typedef enum {
+    STATE_IDLE,
+    STATE_PROCESS_AUDIO,
+    STATE_SEND_FFT,  // Add more states as needed
+} State;
+
+State currentState = STATE_IDLE;
+
 
 /* USER CODE END 0 */
 
@@ -75,9 +103,14 @@ static void MX_ADC1_Init(void);
   * @brief  The application entry point.
   * @retval int
   */
-int main(void)
+//**********************************************************************************************
+//**********************************************************************************************
+//**********************************************************************************************
+int main(void) //***************************************************************************************
 {
   /* USER CODE BEGIN 1 */
+	// Define different states
+
 
   /* USER CODE END 1 */
 
@@ -102,23 +135,52 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
-
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN);
+  arm_rfft_fast_init_f32(&fft_handler, 4096);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+  	switch (currentState)
+  	{
+			case STATE_IDLE:
+				//WAIT
+				dmafree = 1;
+				break;
+			case STATE_PROCESS_AUDIO:
+				//convert to float and call function
+				int fft_in_ptr = 0;
+				for (int i=0; i<ADC_BUF_LEN; i++)
+				{
+					fft_in_buf[fft_in_ptr] = (float32_t) ((int) (adc_buf[i]));
+					fft_in_ptr++;
+				}
+				DoFFT();
+				break;
+			case STATE_SEND_FFT:
+				//send fft data over uart
+				if (uartfree==1) HAL_UART_Transmit_DMA(&huart2, &outarray[0], 2048);
+					uartfree = 0;
+					currentState = STATE_IDLE;
+				break;
+  	}
+
+
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
   }
   /* USER CODE END 3 */
-}
+}//**********************************************************************************************
+//**********************************************************************************************
+//**********************************************************************************************
+//**********************************************************************************************
+
+
 
 /**
   * @brief System Clock Configuration
@@ -260,8 +322,12 @@ static void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Stream6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
@@ -306,17 +372,63 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-// Called when first half of buffer is filled
-void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+float complexABS(float real, float compl) {
+	return sqrtf(real*real+compl*compl);
 }
+void DoFFT()
+{
+	//Do FFT
+	arm_rfft_fast_f32(&fft_handler, fft_in_buf, fft_out_buf, 0);
+
+	int freqs[2048];
+	int freqpoint = 0;
+	int offset = 150; //variable noisefloor offset
+
+	//calculate abs values and linear-to-dB
+	for (int i=0; i<4096; i=i+2) {
+		freqs[freqpoint] = (int)(20*log10f(complexABS(fft_out_buf[i], fft_out_buf[i+1])))-offset;
+		if (freqs[freqpoint]<0) freqs[freqpoint]=0;
+		freqpoint++;
+	}
+
+
+	//push out data to Uart
+	outarray[0] = 0xff; //frame start
+	for (int i = 0; i < 2048; i++)
+	{
+		if (i == 0)
+		{
+			outarray[0] = 0xff; //frame start
+		}
+		else
+		{
+			outarray[i] = (uint8_t)freqs[i];
+		}
+	}
+	currentState = STATE_SEND_FFT;
+}
+
+void HAL_UART_TxCpltCallback (UART_HandleTypeDef *huart)
+{
+	uartfree = 1;
+	huart2.gState=HAL_UART_STATE_READY;
+}
+
+
+// Called when first half of buffer is filled
+/*void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+}*/
 
 // Called when buffer is completely filled
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  if (dmafree)
+  {
+    currentState = STATE_PROCESS_AUDIO;
+    dmafree = 0;
+  }
 }
-
-
 /* USER CODE END 4 */
 
 /**
